@@ -391,10 +391,10 @@ function Merge-DeviceLists {
 function Show-DeviceDialog {
     param([switch]$IsWizard)
 
-    $title = if ($IsWizard) { "NearLock Setup - Select Device" } else { "Select Bluetooth Device" }
+    $title = if ($IsWizard) { "NearLock Setup - Select Device" } else { "Scan for Nearby Devices" }
     $form = New-Object System.Windows.Forms.Form -Property @{
         Text = $title
-        Size = New-Object System.Drawing.Size(500, 450)
+        Size = New-Object System.Drawing.Size(500, 420)
         StartPosition = "CenterScreen"
         FormBorderStyle = "FixedDialog"
         MaximizeBox = $false
@@ -402,100 +402,56 @@ function Show-DeviceDialog {
         TopMost = $true
     }
 
-    # Tab control
-    $tabControl = New-Object System.Windows.Forms.TabControl -Property @{
-        Location = New-Object System.Drawing.Point(10, 10)
-        Size = New-Object System.Drawing.Size(465, 340)
-    }
-
-    # === Tab 1: Paired Devices ===
-    $tabPaired = New-Object System.Windows.Forms.TabPage -Property @{ Text = "Paired Devices" }
-
-    $pairedLabel = New-Object System.Windows.Forms.Label -Property @{
-        Text = "Select a paired device:"
-        Location = New-Object System.Drawing.Point(10, 10)
-        Size = New-Object System.Drawing.Size(430, 20)
-    }
-
-    $pairedList = New-Object System.Windows.Forms.ListView -Property @{
-        Location = New-Object System.Drawing.Point(10, 35)
-        Size = New-Object System.Drawing.Size(435, 260)
-        View = "Details"
-        FullRowSelect = $true
-        GridLines = $true
-    }
-    $pairedList.Columns.Add("Name", 180) | Out-Null
-    $pairedList.Columns.Add("MAC Address", 140) | Out-Null
-    $pairedList.Columns.Add("Status", 100) | Out-Null
-
-    $tabPaired.Controls.AddRange(@($pairedLabel, $pairedList))
-
-    # === Tab 2: Scan Nearby ===
-    $tabScan = New-Object System.Windows.Forms.TabPage -Property @{ Text = "Scan Nearby" }
-
+    # Scan button and status
     $scanBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "Start Scan (~15s)"
-        Location = New-Object System.Drawing.Point(10, 8)
+        Location = New-Object System.Drawing.Point(10, 10)
         Size = New-Object System.Drawing.Size(120, 28)
     }
 
     $scanStatus = New-Object System.Windows.Forms.Label -Property @{
         Text = "Click 'Start Scan' to discover nearby devices"
-        Location = New-Object System.Drawing.Point(140, 14)
-        Size = New-Object System.Drawing.Size(300, 20)
+        Location = New-Object System.Drawing.Point(140, 16)
+        Size = New-Object System.Drawing.Size(330, 20)
         ForeColor = [System.Drawing.Color]::Gray
     }
 
+    # Device list
     $scanList = New-Object System.Windows.Forms.ListView -Property @{
         Location = New-Object System.Drawing.Point(10, 45)
-        Size = New-Object System.Drawing.Size(435, 250)
+        Size = New-Object System.Drawing.Size(465, 280)
         View = "Details"
         FullRowSelect = $true
         GridLines = $true
     }
-    $scanList.Columns.Add("Name", 150) | Out-Null
+    $scanList.Columns.Add("Name", 160) | Out-Null
     $scanList.Columns.Add("MAC Address", 130) | Out-Null
-    $scanList.Columns.Add("BLE MAC", 100) | Out-Null
-    $scanList.Columns.Add("Sources", 100) | Out-Null
-
-    $tabScan.Controls.AddRange(@($scanBtn, $scanStatus, $scanList))
-
-    $tabControl.TabPages.AddRange(@($tabPaired, $tabScan))
+    $scanList.Columns.Add("BLE MAC", 110) | Out-Null
+    $scanList.Columns.Add("Sources", 90) | Out-Null
 
     # Buttons
     $okBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "OK"
-        Location = New-Object System.Drawing.Point(300, 365)
+        Location = New-Object System.Drawing.Point(300, 340)
         Size = New-Object System.Drawing.Size(80, 30)
     }
 
     $cancelBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "Cancel"
-        Location = New-Object System.Drawing.Point(390, 365)
+        Location = New-Object System.Drawing.Point(390, 340)
         Size = New-Object System.Drawing.Size(80, 30)
         DialogResult = "Cancel"
     }
 
-    $form.Controls.AddRange(@($tabControl, $okBtn, $cancelBtn))
+    $form.Controls.AddRange(@($scanBtn, $scanStatus, $scanList, $okBtn, $cancelBtn))
     $form.CancelButton = $cancelBtn
 
     # Store selected device and scanned devices
     $script:selectedDevice = $null
     $script:scannedDevices = @()
 
-    # Load paired devices
+    # Get paired devices for merging
     $pairedDevices = @(Get-PairedDevices)
-    $cfg = Get-Config
-    foreach ($d in $pairedDevices) {
-        $item = New-Object System.Windows.Forms.ListViewItem($d.Name)
-        $item.SubItems.Add($d.MAC) | Out-Null
-        $status = if ($d.Connected) { "Connected" } else { "Paired" }
-        $item.SubItems.Add($status) | Out-Null
-        $item.Tag = $d
-        if ($d.Connected) { $item.ForeColor = [System.Drawing.Color]::Green }
-        if ($cfg -and $d.MAC -eq $cfg.deviceMAC) { $item.Selected = $true }
-        $pairedList.Items.Add($item) | Out-Null
-    }
 
     # Scan button click
     $scanBtn.Add_Click({
@@ -522,6 +478,7 @@ function Show-DeviceDialog {
         $script:scannedDevices = @(Merge-DeviceLists -ClassicDevices $classicDevices -BLEDevices $bleDevices -PairedDevices $pairedDevices)
 
         # Populate list
+        $cfg = Get-Config
         foreach ($d in $script:scannedDevices) {
             $item = New-Object System.Windows.Forms.ListViewItem($d.Name)
             $item.SubItems.Add($d.MAC) | Out-Null
@@ -530,6 +487,8 @@ function Show-DeviceDialog {
             $item.Tag = $d
             if ($d.Connected) { $item.ForeColor = [System.Drawing.Color]::Green }
             elseif ($d.IsPaired) { $item.ForeColor = [System.Drawing.Color]::Blue }
+            # Pre-select current device if configured
+            if ($cfg -and ($d.MAC -eq $cfg.deviceMAC -or $d.BLEMAC -eq $cfg.deviceMAC)) { $item.Selected = $true }
             $scanList.Items.Add($item) | Out-Null
         }
 
@@ -542,41 +501,27 @@ function Show-DeviceDialog {
 
     # OK button click
     $okBtn.Add_Click({
-        $selected = $null
-
-        # Check which tab is active
-        if ($tabControl.SelectedTab -eq $tabPaired) {
-            if ($pairedList.SelectedItems.Count -gt 0) {
-                $selected = $pairedList.SelectedItems[0].Tag
-            }
-        } else {
-            if ($scanList.SelectedItems.Count -gt 0) {
-                $selected = $scanList.SelectedItems[0].Tag
-            }
-        }
-
-        if ($selected) {
+        if ($scanList.SelectedItems.Count -gt 0) {
+            $selected = $scanList.SelectedItems[0].Tag
             # Use BLE MAC if available and different (for BLE-only proximity)
             $macToUse = $selected.MAC
             if ($selected.BLEMAC -and $selected.Sources -contains "BLE") {
-                # Prefer BLE MAC for proximity detection if device was found via BLE
                 $macToUse = if ($selected.BLEMAC) { $selected.BLEMAC } else { $selected.MAC }
             }
             $script:selectedDevice = @{
                 Name = $selected.Name
-                MAC = $macToUse
+                MAC = $selected.MAC
                 BLEMAC = $selected.BLEMAC
                 Sources = $selected.Sources
             }
             $form.DialogResult = "OK"
             $form.Close()
         } else {
-            [System.Windows.Forms.MessageBox]::Show("Please select a device.", "NearLock", 0, 64)
+            [System.Windows.Forms.MessageBox]::Show("Please scan and select a device.", "NearLock", 0, 64)
         }
     })
 
     # Double-click to select
-    $pairedList.Add_DoubleClick({ $okBtn.PerformClick() })
     $scanList.Add_DoubleClick({ $okBtn.PerformClick() })
 
     if ($form.ShowDialog() -eq "OK" -and $script:selectedDevice) {
@@ -589,7 +534,7 @@ function Show-DeviceDialog {
 function Show-SettingsDialog {
     $form = New-Object System.Windows.Forms.Form -Property @{
         Text = "NearLock Settings"
-        Size = New-Object System.Drawing.Size(400, 280)
+        Size = New-Object System.Drawing.Size(420, 320)
         StartPosition = "CenterScreen"
         FormBorderStyle = "FixedDialog"
         MaximizeBox = $false
@@ -605,27 +550,61 @@ function Show-SettingsDialog {
     $deviceGroup = New-Object System.Windows.Forms.GroupBox -Property @{
         Text = "Bluetooth Device"
         Location = New-Object System.Drawing.Point(15, 15)
-        Size = New-Object System.Drawing.Size(355, 80)
+        Size = New-Object System.Drawing.Size(375, 120)
     }
 
     $deviceLabel = New-Object System.Windows.Forms.Label -Property @{
-        Text = "Current device:"
-        Location = New-Object System.Drawing.Point(10, 25)
-        Size = New-Object System.Drawing.Size(85, 20)
+        Text = "Device:"
+        Location = New-Object System.Drawing.Point(10, 22)
+        Size = New-Object System.Drawing.Size(50, 20)
         Font = New-Object System.Drawing.Font("Segoe UI", 9)
     }
 
     $currentDevice = if ($cfg -and $cfg.deviceName) { "$($cfg.deviceName)" } else { "(No device selected)" }
-    $deviceValue = New-Object System.Windows.Forms.Label -Property @{
+    $script:deviceValue = New-Object System.Windows.Forms.Label -Property @{
         Text = $currentDevice
-        Location = New-Object System.Drawing.Point(100, 25)
-        Size = New-Object System.Drawing.Size(240, 20)
+        Location = New-Object System.Drawing.Point(65, 22)
+        Size = New-Object System.Drawing.Size(295, 20)
         Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    }
+
+    $macLabel = New-Object System.Windows.Forms.Label -Property @{
+        Text = "MAC:"
+        Location = New-Object System.Drawing.Point(10, 44)
+        Size = New-Object System.Drawing.Size(50, 18)
+        Font = New-Object System.Drawing.Font("Segoe UI", 8)
+        ForeColor = [System.Drawing.Color]::Gray
+    }
+
+    $currentMAC = if ($cfg -and $cfg.deviceMAC) { $cfg.deviceMAC } else { "-" }
+    $script:macValue = New-Object System.Windows.Forms.Label -Property @{
+        Text = $currentMAC
+        Location = New-Object System.Drawing.Point(65, 44)
+        Size = New-Object System.Drawing.Size(295, 18)
+        Font = New-Object System.Drawing.Font("Consolas", 8)
+        ForeColor = [System.Drawing.Color]::Gray
+    }
+
+    $bleMacLabel = New-Object System.Windows.Forms.Label -Property @{
+        Text = "BLE:"
+        Location = New-Object System.Drawing.Point(10, 62)
+        Size = New-Object System.Drawing.Size(50, 18)
+        Font = New-Object System.Drawing.Font("Segoe UI", 8)
+        ForeColor = [System.Drawing.Color]::Gray
+    }
+
+    $currentBLEMAC = if ($cfg -and $cfg.deviceBLEMAC) { $cfg.deviceBLEMAC } else { "-" }
+    $script:bleMacValue = New-Object System.Windows.Forms.Label -Property @{
+        Text = $currentBLEMAC
+        Location = New-Object System.Drawing.Point(65, 62)
+        Size = New-Object System.Drawing.Size(295, 18)
+        Font = New-Object System.Drawing.Font("Consolas", 8)
+        ForeColor = [System.Drawing.Color]::Gray
     }
 
     $changeBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "Change Device..."
-        Location = New-Object System.Drawing.Point(10, 48)
+        Location = New-Object System.Drawing.Point(10, 85)
         Size = New-Object System.Drawing.Size(120, 25)
         Font = New-Object System.Drawing.Font("Segoe UI", 9)
     }
@@ -633,25 +612,27 @@ function Show-SettingsDialog {
         $sel = Show-DeviceDialog
         if ($sel) {
             Save-Config -mac $sel.MAC -name $sel.Name -bleMac $sel.BLEMAC
-            $deviceValue.Text = $sel.Name
+            $script:deviceValue.Text = $sel.Name
+            $script:macValue.Text = if ($sel.MAC) { $sel.MAC } else { "-" }
+            $script:bleMacValue.Text = if ($sel.BLEMAC) { $sel.BLEMAC } else { "-" }
             $script:deviceChanged = $true
             $script:settingsChanged = $true
         }
     })
 
-    $deviceGroup.Controls.AddRange(@($deviceLabel, $deviceValue, $changeBtn))
+    $deviceGroup.Controls.AddRange(@($deviceLabel, $script:deviceValue, $macLabel, $script:macValue, $bleMacLabel, $script:bleMacValue, $changeBtn))
 
     # --- Startup section ---
     $startupGroup = New-Object System.Windows.Forms.GroupBox -Property @{
         Text = "Startup"
-        Location = New-Object System.Drawing.Point(15, 105)
-        Size = New-Object System.Drawing.Size(355, 70)
+        Location = New-Object System.Drawing.Point(15, 145)
+        Size = New-Object System.Drawing.Size(375, 70)
     }
 
     $startupCheck = New-Object System.Windows.Forms.CheckBox -Property @{
         Text = "Start NearLock automatically when Windows starts"
         Location = New-Object System.Drawing.Point(10, 28)
-        Size = New-Object System.Drawing.Size(330, 24)
+        Size = New-Object System.Drawing.Size(350, 24)
         Font = New-Object System.Drawing.Font("Segoe UI", 9)
         Checked = (Get-StartOnBoot)
     }
@@ -662,7 +643,7 @@ function Show-SettingsDialog {
     # --- Buttons ---
     $okBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "OK"
-        Location = New-Object System.Drawing.Point(200, 195)
+        Location = New-Object System.Drawing.Point(220, 235)
         Size = New-Object System.Drawing.Size(80, 30)
         Font = New-Object System.Drawing.Font("Segoe UI", 9)
     }
@@ -674,7 +655,7 @@ function Show-SettingsDialog {
 
     $cancelBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "Cancel"
-        Location = New-Object System.Drawing.Point(290, 195)
+        Location = New-Object System.Drawing.Point(310, 235)
         Size = New-Object System.Drawing.Size(80, 30)
         Font = New-Object System.Drawing.Font("Segoe UI", 9)
     }
