@@ -33,6 +33,17 @@ NearLock monitors a paired Bluetooth device (like your phone) and automatically 
 - **Paired Bluetooth device** (phone, smartwatch, etc.)
 - **PowerShell 5.1+** (included with Windows 10/11)
 
+> ⚠️ **Important: Phone Link Required for Reliable Detection**
+>
+> For reliable presence detection, your phone **must be connected via Phone Link (Mobile Connecté)**.
+> Simply having Bluetooth enabled is not enough - modern phones don't continuously advertise their presence to save battery.
+>
+> **Setup Phone Link:**
+> 1. Install "Link to Windows" app on your phone
+> 2. Open Phone Link on your PC (pre-installed on Windows 10/11)
+> 3. Pair your phone following the instructions
+> 4. Keep Phone Link running for continuous Bluetooth connection
+
 ## Installation
 
 ### Option 1: Download Release (Recommended)
@@ -121,9 +132,9 @@ Logs are stored in `%LOCALAPPDATA%\NearLock\logs\`.
 
 NearLock uses multiple detection methods for reliability:
 
-1. **Bluetooth Classic API** - Uses Windows `bthprops.cpl` to check device connection status
-2. **BLE PnP Device** - Monitors Bluetooth Low Energy device status via PnP subsystem
-3. **Radio Scan** - Performs active Bluetooth inquiry as fallback confirmation
+1. **Bluetooth Classic API** - Uses Windows `bthprops.cpl` to check device connection status (requires Phone Link)
+2. **BLE GATT Proximity** - Uses WinRT to attempt GATT connection with uncached mode for accurate presence detection
+3. **Radio Scan** - Performs active Bluetooth inquiry as fallback confirmation before locking
 
 ### Timing Parameters
 

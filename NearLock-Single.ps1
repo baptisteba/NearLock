@@ -402,24 +402,33 @@ function Show-DeviceDialog {
         TopMost = $true
     }
 
+    # Warning label
+    $warningLabel = New-Object System.Windows.Forms.Label -Property @{
+        Text = "⚠ Phone Link / Mobile Connecte required for reliable detection"
+        Location = New-Object System.Drawing.Point(10, 10)
+        Size = New-Object System.Drawing.Size(465, 20)
+        ForeColor = [System.Drawing.Color]::DarkOrange
+        Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    }
+
     # Scan button and status
     $scanBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "Start Scan (~15s)"
-        Location = New-Object System.Drawing.Point(10, 10)
+        Location = New-Object System.Drawing.Point(10, 35)
         Size = New-Object System.Drawing.Size(120, 28)
     }
 
     $scanStatus = New-Object System.Windows.Forms.Label -Property @{
         Text = "Click 'Start Scan' to discover nearby devices"
-        Location = New-Object System.Drawing.Point(140, 16)
+        Location = New-Object System.Drawing.Point(140, 41)
         Size = New-Object System.Drawing.Size(330, 20)
         ForeColor = [System.Drawing.Color]::Gray
     }
 
     # Device list
     $scanList = New-Object System.Windows.Forms.ListView -Property @{
-        Location = New-Object System.Drawing.Point(10, 45)
-        Size = New-Object System.Drawing.Size(465, 280)
+        Location = New-Object System.Drawing.Point(10, 70)
+        Size = New-Object System.Drawing.Size(465, 255)
         View = "Details"
         FullRowSelect = $true
         GridLines = $true
@@ -443,7 +452,7 @@ function Show-DeviceDialog {
         DialogResult = "Cancel"
     }
 
-    $form.Controls.AddRange(@($scanBtn, $scanStatus, $scanList, $okBtn, $cancelBtn))
+    $form.Controls.AddRange(@($warningLabel, $scanBtn, $scanStatus, $scanList, $okBtn, $cancelBtn))
     $form.CancelButton = $cancelBtn
 
     # Store selected device and scanned devices
@@ -620,7 +629,15 @@ function Show-SettingsDialog {
         }
     })
 
-    $deviceGroup.Controls.AddRange(@($deviceLabel, $script:deviceValue, $macLabel, $script:macValue, $bleMacLabel, $script:bleMacValue, $changeBtn))
+    $phoneLinkWarning = New-Object System.Windows.Forms.Label -Property @{
+        Text = "⚠ Phone Link required"
+        Location = New-Object System.Drawing.Point(140, 89)
+        Size = New-Object System.Drawing.Size(200, 18)
+        ForeColor = [System.Drawing.Color]::DarkOrange
+        Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    }
+
+    $deviceGroup.Controls.AddRange(@($deviceLabel, $script:deviceValue, $macLabel, $script:macValue, $bleMacLabel, $script:bleMacValue, $changeBtn, $phoneLinkWarning))
 
     # --- Startup section ---
     $startupGroup = New-Object System.Windows.Forms.GroupBox -Property @{
@@ -955,10 +972,11 @@ $script:monitorScript = {
             $servicesResult = Await-WinRT ($bleDevice.GetGattServicesAsync($uncached)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
 
             $isNearby = $false
-            if ($null -ne $servicesResult -and $servicesResult.Status -eq [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus]::Success) {
-                # Double-check: verify device is actually connected after GATT query
-                if ($bleDevice.ConnectionStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected) {
-                    $isNearby = $true
+            if ($null -ne $servicesResult) {
+                if ($servicesResult.Status -eq [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus]::Success) {
+                    if ($bleDevice.ConnectionStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected) {
+                        $isNearby = $true
+                    }
                 }
             }
 
@@ -979,9 +997,6 @@ $script:monitorScript = {
         if (-not $classic) {
             $bleProximity = Test-BLEProximity
         }
-
-        # Debug: log each check result
-        Write-Log "Check: Classic=$classic, BLEProx=$bleProximity"
 
         return @{ Classic = $classic; BLE = $false; BLEProximity = $bleProximity; Connected = ($classic -or $bleProximity) }
     }
