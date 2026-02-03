@@ -1,8 +1,14 @@
 # NearLock - Single EXE version
 # All-in-one: Tray + Monitor + Watchdog using background runspace
+# Detection: Classic BT + BLE + BLE-Proximity (WinRT GATT)
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+# Load WinRT types for BLE proximity check
+$null = [Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+$null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
 
 # --- Paths ---
 $script:dataDir = Join-Path $env:LOCALAPPDATA "NearLock"
@@ -530,6 +536,24 @@ function Show-LogWindow {
 $script:monitorScript = {
     param($configPath, $logDir)
 
+    # Load WinRT for BLE proximity in runspace
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $null = [Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+
+    # Helper to await WinRT async operations
+    $script:asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+
+    function Await-WinRT($WinRtTask, $ResultType) {
+        $asTask = $script:asTaskGeneric.MakeGenericMethod($ResultType)
+        $netTask = $asTask.Invoke($null, @($WinRtTask))
+        $netTask.Wait(10000) | Out-Null
+        if ($netTask.IsCompleted) { return $netTask.Result }
+        return $null
+    }
+
     function Write-Log($msg) {
         $logFile = Join-Path $logDir "NearLock_$(Get-Date -Format 'yyyy-MM-dd').log"
         try { Add-Content -Path $logFile -Value "[$(Get-Date -Format 'HH:mm:ss')] $msg" -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
@@ -568,13 +592,28 @@ $script:monitorScript = {
 
     $targetAddr = [BT]::ParseMAC($targetMAC)
     $targetBLE = "DEV_" + ($targetMAC -replace ':', '').ToUpper()
+    $targetBLEAddr = [Convert]::ToUInt64(($targetMAC -replace ':', ''), 16)
 
     Write-Log "=== NearLock Monitor ==="
     Write-Log "Device: $deviceName ($targetMAC)"
+    Write-Log "Detection: Classic BT + BLE + BLE-Proximity"
 
     $pollInterval = 4; $lockThreshold = 20; $graceAfterResume = 30
     $disconnectedSince = $null; $wasConnected = $false; $everConnected = $false
     $lastPoll = Get-Date; $errors = 0; $startupShown = $false
+
+    # BLE Proximity check via WinRT GATT - detects nearby devices even when not connected
+    function Test-BLEProximity {
+        try {
+            $bleDevice = Await-WinRT ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($targetBLEAddr)) ([Windows.Devices.Bluetooth.BluetoothLEDevice])
+            if ($null -eq $bleDevice) { return $false }
+            $servicesResult = Await-WinRT ($bleDevice.GetGattServicesAsync()) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
+            if ($null -ne $servicesResult -and $servicesResult.Status -eq [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus]::Success) {
+                return $true
+            }
+            return $false
+        } catch { return $false }
+    }
 
     function Test-Present {
         $classic = [BT]::IsConnected($targetAddr)
@@ -588,7 +627,14 @@ $script:monitorScript = {
                 }
             }
         } catch {}
-        return @{ Classic = $classic; BLE = $ble; Connected = ($classic -or $ble) }
+
+        # Fallback: BLE proximity via WinRT GATT (device nearby but not actively connected)
+        $bleProximity = $false
+        if (-not $classic -and -not $ble) {
+            $bleProximity = Test-BLEProximity
+        }
+
+        return @{ Classic = $classic; BLE = $ble; BLEProximity = $bleProximity; Connected = ($classic -or $ble -or $bleProximity) }
     }
 
     while ($true) {
@@ -608,14 +654,22 @@ $script:monitorScript = {
 
             if ($st.Connected) {
                 if (-not $wasConnected) {
-                    $src = @(); if ($st.Classic) { $src += "classic" }; if ($st.BLE) { $src += "BLE" }
+                    $src = @(); if ($st.Classic) { $src += "classic" }; if ($st.BLE) { $src += "BLE" }; if ($st.BLEProximity) { $src += "BLE-proximite" }
                     Write-Log "CONNECTE ($($src -join '+'))"
                 }
                 $disconnectedSince = $null; $wasConnected = $true; $everConnected = $true
             } else {
                 if (-not $everConnected) {
                     if (-not $startupShown) { Write-Log "$deviceName non connecte - scan de recherche actif"; $startupShown = $true }
-                    if ([BT]::IsNearby($targetAddr, 2)) {
+                    $nearby = [BT]::IsNearby($targetAddr, 2)
+                    if (-not $nearby) {
+                        # Fallback to BLE GATT proximity
+                        $nearby = Test-BLEProximity
+                        if ($nearby) {
+                            Write-Log "Found via BLE GATT - CONNECTE"
+                            $wasConnected = $true; $everConnected = $true; $disconnectedSince = $null
+                        }
+                    } else {
                         Write-Log "Found via scan - CONNECTE"
                         $wasConnected = $true; $everConnected = $true; $disconnectedSince = $null
                     }
@@ -629,8 +683,15 @@ $script:monitorScript = {
                         Write-Log "Away $([int]$elapsed)s / ${lockThreshold}s"
                         if ($elapsed -ge $lockThreshold) {
                             Write-Log "Confirmation scan..."
-                            if ([BT]::IsNearby($targetAddr, 4)) {
-                                Write-Log "Found - false alarm"
+                            $nearby = [BT]::IsNearby($targetAddr, 4)
+                            $bleNearby = $false
+                            if (-not $nearby) {
+                                Write-Log "BLE GATT confirmation..."
+                                $bleNearby = Test-BLEProximity
+                            }
+                            if ($nearby -or $bleNearby) {
+                                $method = if ($nearby) { "scan" } else { "BLE GATT" }
+                                Write-Log "Found via $method - false alarm"
                                 $disconnectedSince = $null; $wasConnected = $true
                             } else {
                                 Write-Log "Confirmed - LOCKING"
@@ -776,7 +837,11 @@ $timer.Add_Tick({
         $last = ($lines | Select-Object -Last 3) -join "`n"
         if ($last -match 'No device configured') { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock: No device" }
         elseif ($last -match 'non connecte|scan de recherche') { $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Searching..." }
-        elseif ($last -match 'CONNECTE' -and $last -notmatch 'DECONNECTE') { $script:tray.Icon = $script:iconGreen; $script:tray.Text = "NearLock: Connected" }
+        elseif ($last -match 'CONNECTE' -and $last -notmatch 'DECONNECTE') {
+            $script:tray.Icon = $script:iconGreen
+            if ($last -match 'BLE-proximite|BLE GATT') { $script:tray.Text = "NearLock: Nearby (BLE)" }
+            else { $script:tray.Text = "NearLock: Connected" }
+        }
         elseif ($last -match 'Starting|Demarrage') { $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Starting..." }
         else { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock" }
     } catch { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock (error)" }
