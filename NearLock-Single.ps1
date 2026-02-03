@@ -863,7 +863,10 @@ $script:monitorScript = {
     # Load WinRT for BLE proximity in runspace
     Add-Type -AssemblyName System.Runtime.WindowsRuntime
     $null = [Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.BluetoothCacheMode, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.BluetoothConnectionStatus, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
     $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
 
     # Helper to await WinRT async operations
     $script:asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
@@ -941,15 +944,28 @@ $script:monitorScript = {
     $lastPoll = Get-Date; $errors = 0; $startupShown = $false
 
     # BLE Proximity check via WinRT GATT - detects nearby devices even when not connected
+    # Uses Uncached mode to force actual connection attempt
     function Test-BLEProximity {
         try {
             $bleDevice = Await-WinRT ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($targetBLEAddr)) ([Windows.Devices.Bluetooth.BluetoothLEDevice])
             if ($null -eq $bleDevice) { return $false }
-            $servicesResult = Await-WinRT ($bleDevice.GetGattServicesAsync()) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
+
+            # Use Uncached mode to force fresh GATT query (not from cache)
+            $uncached = [Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached
+            $servicesResult = Await-WinRT ($bleDevice.GetGattServicesAsync($uncached)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
+
+            $isNearby = $false
             if ($null -ne $servicesResult -and $servicesResult.Status -eq [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus]::Success) {
-                return $true
+                # Double-check: verify device is actually connected after GATT query
+                if ($bleDevice.ConnectionStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected) {
+                    $isNearby = $true
+                }
             }
-            return $false
+
+            # Close connection to ensure fresh check next time
+            try { $bleDevice.Close() } catch {}
+
+            return $isNearby
         } catch { return $false }
     }
 
