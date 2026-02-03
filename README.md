@@ -87,7 +87,7 @@ Access settings from the tray menu to:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/NearLock.git
+   git clone https://github.com/baptisteba/NearLock.git
    cd NearLock
    ```
 
