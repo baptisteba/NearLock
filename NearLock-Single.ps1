@@ -160,11 +160,12 @@ function Get-Config {
 }
 
 function Save-Config {
-    param($mac, $name, $startOnBoot = $null)
+    param($mac, $name, $bleMac = $null, $startOnBoot = $null)
     $cfg = Get-Config
     $data = @{
         deviceMAC = if ($mac) { $mac } elseif ($cfg) { $cfg.deviceMAC } else { $null }
         deviceName = if ($name) { $name } elseif ($cfg) { $cfg.deviceName } else { $null }
+        deviceBLEMAC = if ($bleMac) { $bleMac } elseif ($cfg -and $cfg.deviceBLEMAC) { $cfg.deviceBLEMAC } else { $null }
         startOnBoot = if ($null -ne $startOnBoot) { $startOnBoot } elseif ($cfg -and $null -ne $cfg.startOnBoot) { $cfg.startOnBoot } else { $false }
     }
     $data | ConvertTo-Json | Set-Content $script:configPath -Encoding UTF8
@@ -196,48 +197,390 @@ function Set-StartOnBoot($enabled) {
 
 function Get-PairedDevices {
     try {
-        [BT]::GetPaired() | ForEach-Object { [PSCustomObject]@{ Name = $_.Item1; MAC = $_.Item2; Connected = $_.Item3 } }
+        [BT]::GetPaired() | ForEach-Object { [PSCustomObject]@{ Name = $_.Item1; MAC = $_.Item2; Connected = $_.Item3; Source = "Paired" } }
     } catch { @() }
+}
+
+# Helper to await WinRT async operations (for main thread)
+$script:asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+
+function Await-WinRT($WinRtTask, $ResultType) {
+    $asTask = $script:asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(15000) | Out-Null
+    if ($netTask.IsCompleted) { return $netTask.Result }
+    return $null
+}
+
+# Scan for nearby Classic Bluetooth devices via inquiry
+function Get-NearbyClassicBT {
+    param([byte]$TimeoutMultiplier = 4)
+    $devices = @()
+    try {
+        $searchParams = New-Object BT+SEARCH_PARAMS
+        $searchParams.dwSize = [System.Runtime.InteropServices.Marshal]::SizeOf([Type][BT+SEARCH_PARAMS])
+        $searchParams.fReturnAuthenticated = $false
+        $searchParams.fReturnRemembered = $false
+        $searchParams.fReturnUnknown = $true
+        $searchParams.fReturnConnected = $true
+        $searchParams.fIssueInquiry = $true
+        $searchParams.cTimeoutMultiplier = $TimeoutMultiplier
+
+        $deviceInfo = New-Object BT+DEVICE_INFO
+        $deviceInfo.dwSize = [System.Runtime.InteropServices.Marshal]::SizeOf([Type][BT+DEVICE_INFO])
+
+        $handle = [BT]::BluetoothFindFirstDevice([ref]$searchParams, [ref]$deviceInfo)
+        if ($handle -ne [IntPtr]::Zero) {
+            try {
+                do {
+                    $mac = [BT]::FormatMAC($deviceInfo.Address)
+                    $name = if ($deviceInfo.szName) { $deviceInfo.szName } else { "(Unknown)" }
+                    $devices += [PSCustomObject]@{
+                        Name = $name
+                        MAC = $mac
+                        Connected = $deviceInfo.fConnected
+                        Source = "Classic BT"
+                        Address = $deviceInfo.Address
+                    }
+                } while ([BT]::BluetoothFindNextDevice($handle, [ref]$deviceInfo))
+            } finally {
+                [BT]::BluetoothFindDeviceClose($handle) | Out-Null
+            }
+        }
+    } catch {}
+    return $devices
+}
+
+# Scan for nearby BLE devices via WinRT
+function Get-NearbyBLE {
+    $devices = @()
+    try {
+        $null = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime]
+        $null = [Windows.Devices.Enumeration.DeviceInformationCollection, Windows.Devices.Enumeration, ContentType=WindowsRuntime]
+
+        # Get unpaired BLE devices
+        $bleSelector = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false)
+        $bleDevices = Await-WinRT ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($bleSelector)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
+
+        if ($bleDevices) {
+            foreach ($dev in $bleDevices) {
+                # Extract MAC from device ID (format: BluetoothLE#BluetoothLExx:xx:xx:xx:xx:xx-yy:yy:yy:yy:yy:yy)
+                if ($dev.Id -match '([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$') {
+                    $mac = $Matches[0] -replace '-', ':'
+                    $mac = $mac.ToUpper()
+                    $name = if ($dev.Name) { $dev.Name } else { "(Unknown BLE)" }
+                    $devices += [PSCustomObject]@{
+                        Name = $name
+                        MAC = $mac
+                        Connected = $false
+                        Source = "BLE"
+                        DeviceId = $dev.Id
+                    }
+                }
+            }
+        }
+
+        # Also get paired BLE devices
+        $blePairedSelector = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($true)
+        $blePairedDevices = Await-WinRT ([Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($blePairedSelector)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
+
+        if ($blePairedDevices) {
+            foreach ($dev in $blePairedDevices) {
+                if ($dev.Id -match '([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}$') {
+                    $mac = $Matches[0] -replace '-', ':'
+                    $mac = $mac.ToUpper()
+                    # Check if already in list
+                    if (-not ($devices | Where-Object { $_.MAC -eq $mac })) {
+                        $name = if ($dev.Name) { $dev.Name } else { "(Unknown BLE)" }
+                        $devices += [PSCustomObject]@{
+                            Name = $name
+                            MAC = $mac
+                            Connected = $false
+                            Source = "BLE (Paired)"
+                            DeviceId = $dev.Id
+                        }
+                    }
+                }
+            }
+        }
+    } catch {}
+    return $devices
+}
+
+# Merge Classic BT and BLE devices, linking related MACs
+function Merge-DeviceLists {
+    param($ClassicDevices, $BLEDevices, $PairedDevices)
+
+    $merged = @{}
+
+    # Add paired devices first
+    foreach ($d in $PairedDevices) {
+        $key = $d.MAC
+        $merged[$key] = [PSCustomObject]@{
+            Name = $d.Name
+            MAC = $d.MAC
+            BLEMAC = $null
+            Connected = $d.Connected
+            Sources = @("Paired")
+            IsPaired = $true
+        }
+    }
+
+    # Add/merge Classic BT devices
+    foreach ($d in $ClassicDevices) {
+        $key = $d.MAC
+        if ($merged.ContainsKey($key)) {
+            if ("Classic BT" -notin $merged[$key].Sources) {
+                $merged[$key].Sources += "Classic BT"
+            }
+            if ($d.Connected) { $merged[$key].Connected = $true }
+        } else {
+            $merged[$key] = [PSCustomObject]@{
+                Name = $d.Name
+                MAC = $d.MAC
+                BLEMAC = $null
+                Connected = $d.Connected
+                Sources = @("Classic BT")
+                IsPaired = $false
+            }
+        }
+    }
+
+    # Add/merge BLE devices - try to link by name or add as separate
+    foreach ($d in $BLEDevices) {
+        $linked = $false
+        # Try to find matching device by name
+        foreach ($key in @($merged.Keys)) {
+            $existing = $merged[$key]
+            if ($existing.Name -eq $d.Name -and $d.Name -ne "(Unknown BLE)" -and $d.Name -ne "(Unknown)") {
+                # Link BLE MAC to existing device
+                $existing.BLEMAC = $d.MAC
+                if ("BLE" -notin $existing.Sources) {
+                    $existing.Sources += "BLE"
+                }
+                $linked = $true
+                break
+            }
+        }
+
+        if (-not $linked) {
+            # Check if MAC already exists (some devices use same MAC for BT and BLE)
+            if ($merged.ContainsKey($d.MAC)) {
+                if ("BLE" -notin $merged[$d.MAC].Sources) {
+                    $merged[$d.MAC].Sources += "BLE"
+                }
+            } else {
+                # Add as new BLE-only device
+                $merged[$d.MAC] = [PSCustomObject]@{
+                    Name = $d.Name
+                    MAC = $d.MAC
+                    BLEMAC = $d.MAC
+                    Connected = $false
+                    Sources = @("BLE")
+                    IsPaired = ($d.Source -eq "BLE (Paired)")
+                }
+            }
+        }
+    }
+
+    return $merged.Values | Sort-Object -Property @{Expression={$_.IsPaired}; Descending=$true}, @{Expression={$_.Connected}; Descending=$true}, Name
 }
 
 function Show-DeviceDialog {
     param([switch]$IsWizard)
 
-    $devices = @(Get-PairedDevices)
-    if ($devices.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No paired Bluetooth devices found.`n`nPair a device in Windows Settings first.", "NearLock", 0, 64)
-        return $null
-    }
-
     $title = if ($IsWizard) { "NearLock Setup - Select Device" } else { "Select Bluetooth Device" }
     $form = New-Object System.Windows.Forms.Form -Property @{
-        Text = $title; Size = "350,300"; StartPosition = "CenterScreen"
-        FormBorderStyle = "FixedDialog"; MaximizeBox = $false; MinimizeBox = $false; TopMost = $true
+        Text = $title
+        Size = New-Object System.Drawing.Size(500, 450)
+        StartPosition = "CenterScreen"
+        FormBorderStyle = "FixedDialog"
+        MaximizeBox = $false
+        MinimizeBox = $false
+        TopMost = $true
     }
 
-    $label = New-Object System.Windows.Forms.Label -Property @{ Text = "Select device to monitor:"; Location = "10,10"; Size = "320,20" }
-    $listBox = New-Object System.Windows.Forms.ListBox -Property @{ Location = "10,35"; Size = "315,170"; ItemHeight = 32 }
-    $listBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    # Tab control
+    $tabControl = New-Object System.Windows.Forms.TabControl -Property @{
+        Location = New-Object System.Drawing.Point(10, 10)
+        Size = New-Object System.Drawing.Size(465, 340)
+    }
 
+    # === Tab 1: Paired Devices ===
+    $tabPaired = New-Object System.Windows.Forms.TabPage -Property @{ Text = "Paired Devices" }
+
+    $pairedLabel = New-Object System.Windows.Forms.Label -Property @{
+        Text = "Select a paired device:"
+        Location = New-Object System.Drawing.Point(10, 10)
+        Size = New-Object System.Drawing.Size(430, 20)
+    }
+
+    $pairedList = New-Object System.Windows.Forms.ListView -Property @{
+        Location = New-Object System.Drawing.Point(10, 35)
+        Size = New-Object System.Drawing.Size(435, 260)
+        View = "Details"
+        FullRowSelect = $true
+        GridLines = $true
+    }
+    $pairedList.Columns.Add("Name", 180) | Out-Null
+    $pairedList.Columns.Add("MAC Address", 140) | Out-Null
+    $pairedList.Columns.Add("Status", 100) | Out-Null
+
+    $tabPaired.Controls.AddRange(@($pairedLabel, $pairedList))
+
+    # === Tab 2: Scan Nearby ===
+    $tabScan = New-Object System.Windows.Forms.TabPage -Property @{ Text = "Scan Nearby" }
+
+    $scanBtn = New-Object System.Windows.Forms.Button -Property @{
+        Text = "Start Scan (~15s)"
+        Location = New-Object System.Drawing.Point(10, 8)
+        Size = New-Object System.Drawing.Size(120, 28)
+    }
+
+    $scanStatus = New-Object System.Windows.Forms.Label -Property @{
+        Text = "Click 'Start Scan' to discover nearby devices"
+        Location = New-Object System.Drawing.Point(140, 14)
+        Size = New-Object System.Drawing.Size(300, 20)
+        ForeColor = [System.Drawing.Color]::Gray
+    }
+
+    $scanList = New-Object System.Windows.Forms.ListView -Property @{
+        Location = New-Object System.Drawing.Point(10, 45)
+        Size = New-Object System.Drawing.Size(435, 250)
+        View = "Details"
+        FullRowSelect = $true
+        GridLines = $true
+    }
+    $scanList.Columns.Add("Name", 150) | Out-Null
+    $scanList.Columns.Add("MAC Address", 130) | Out-Null
+    $scanList.Columns.Add("BLE MAC", 100) | Out-Null
+    $scanList.Columns.Add("Sources", 100) | Out-Null
+
+    $tabScan.Controls.AddRange(@($scanBtn, $scanStatus, $scanList))
+
+    $tabControl.TabPages.AddRange(@($tabPaired, $tabScan))
+
+    # Buttons
+    $okBtn = New-Object System.Windows.Forms.Button -Property @{
+        Text = "OK"
+        Location = New-Object System.Drawing.Point(300, 365)
+        Size = New-Object System.Drawing.Size(80, 30)
+    }
+
+    $cancelBtn = New-Object System.Windows.Forms.Button -Property @{
+        Text = "Cancel"
+        Location = New-Object System.Drawing.Point(390, 365)
+        Size = New-Object System.Drawing.Size(80, 30)
+        DialogResult = "Cancel"
+    }
+
+    $form.Controls.AddRange(@($tabControl, $okBtn, $cancelBtn))
+    $form.CancelButton = $cancelBtn
+
+    # Store selected device and scanned devices
+    $script:selectedDevice = $null
+    $script:scannedDevices = @()
+
+    # Load paired devices
+    $pairedDevices = @(Get-PairedDevices)
     $cfg = Get-Config
-    $sel = -1
-    for ($i = 0; $i -lt $devices.Count; $i++) {
-        $d = $devices[$i]
-        $status = if ($d.Connected) { " [Connected]" } else { "" }
-        $listBox.Items.Add("$($d.Name)$status - $($d.MAC)") | Out-Null
-        if ($cfg -and $d.MAC -eq $cfg.deviceMAC) { $sel = $i }
+    foreach ($d in $pairedDevices) {
+        $item = New-Object System.Windows.Forms.ListViewItem($d.Name)
+        $item.SubItems.Add($d.MAC) | Out-Null
+        $status = if ($d.Connected) { "Connected" } else { "Paired" }
+        $item.SubItems.Add($status) | Out-Null
+        $item.Tag = $d
+        if ($d.Connected) { $item.ForeColor = [System.Drawing.Color]::Green }
+        if ($cfg -and $d.MAC -eq $cfg.deviceMAC) { $item.Selected = $true }
+        $pairedList.Items.Add($item) | Out-Null
     }
-    $listBox.SelectedIndex = if ($sel -ge 0) { $sel } else { 0 }
 
-    $okBtn = New-Object System.Windows.Forms.Button -Property @{ Text = "OK"; Location = "160,220"; Size = "75,28"; DialogResult = "OK" }
-    $cancelBtn = New-Object System.Windows.Forms.Button -Property @{ Text = "Cancel"; Location = "250,220"; Size = "75,28"; DialogResult = "Cancel" }
+    # Scan button click
+    $scanBtn.Add_Click({
+        $scanBtn.Enabled = $false
+        $scanBtn.Text = "Scanning..."
+        $scanStatus.Text = "Scanning for Classic Bluetooth devices..."
+        $scanStatus.ForeColor = [System.Drawing.Color]::Blue
+        $scanList.Items.Clear()
+        $form.Refresh()
 
-    $form.Controls.AddRange(@($label, $listBox, $okBtn, $cancelBtn))
-    $form.AcceptButton = $okBtn; $form.CancelButton = $cancelBtn
+        # Scan Classic BT (takes ~5-10s)
+        $classicDevices = @(Get-NearbyClassicBT -TimeoutMultiplier 4)
 
-    if ($form.ShowDialog() -eq "OK" -and $listBox.SelectedIndex -ge 0) {
-        $d = $devices[$listBox.SelectedIndex]
-        return @{ Name = $d.Name; MAC = $d.MAC }
+        $scanStatus.Text = "Scanning for BLE devices..."
+        $form.Refresh()
+
+        # Scan BLE
+        $bleDevices = @(Get-NearbyBLE)
+
+        $scanStatus.Text = "Merging results..."
+        $form.Refresh()
+
+        # Merge all devices
+        $script:scannedDevices = @(Merge-DeviceLists -ClassicDevices $classicDevices -BLEDevices $bleDevices -PairedDevices $pairedDevices)
+
+        # Populate list
+        foreach ($d in $script:scannedDevices) {
+            $item = New-Object System.Windows.Forms.ListViewItem($d.Name)
+            $item.SubItems.Add($d.MAC) | Out-Null
+            $item.SubItems.Add($(if ($d.BLEMAC -and $d.BLEMAC -ne $d.MAC) { $d.BLEMAC } else { "-" })) | Out-Null
+            $item.SubItems.Add(($d.Sources -join ", ")) | Out-Null
+            $item.Tag = $d
+            if ($d.Connected) { $item.ForeColor = [System.Drawing.Color]::Green }
+            elseif ($d.IsPaired) { $item.ForeColor = [System.Drawing.Color]::Blue }
+            $scanList.Items.Add($item) | Out-Null
+        }
+
+        $count = $script:scannedDevices.Count
+        $scanStatus.Text = "Found $count device(s). Select one and click OK."
+        $scanStatus.ForeColor = [System.Drawing.Color]::DarkGreen
+        $scanBtn.Text = "Rescan"
+        $scanBtn.Enabled = $true
+    })
+
+    # OK button click
+    $okBtn.Add_Click({
+        $selected = $null
+
+        # Check which tab is active
+        if ($tabControl.SelectedTab -eq $tabPaired) {
+            if ($pairedList.SelectedItems.Count -gt 0) {
+                $selected = $pairedList.SelectedItems[0].Tag
+            }
+        } else {
+            if ($scanList.SelectedItems.Count -gt 0) {
+                $selected = $scanList.SelectedItems[0].Tag
+            }
+        }
+
+        if ($selected) {
+            # Use BLE MAC if available and different (for BLE-only proximity)
+            $macToUse = $selected.MAC
+            if ($selected.BLEMAC -and $selected.Sources -contains "BLE") {
+                # Prefer BLE MAC for proximity detection if device was found via BLE
+                $macToUse = if ($selected.BLEMAC) { $selected.BLEMAC } else { $selected.MAC }
+            }
+            $script:selectedDevice = @{
+                Name = $selected.Name
+                MAC = $macToUse
+                BLEMAC = $selected.BLEMAC
+                Sources = $selected.Sources
+            }
+            $form.DialogResult = "OK"
+            $form.Close()
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Please select a device.", "NearLock", 0, 64)
+        }
+    })
+
+    # Double-click to select
+    $pairedList.Add_DoubleClick({ $okBtn.PerformClick() })
+    $scanList.Add_DoubleClick({ $okBtn.PerformClick() })
+
+    if ($form.ShowDialog() -eq "OK" -and $script:selectedDevice) {
+        return $script:selectedDevice
     }
     return $null
 }
@@ -289,7 +632,7 @@ function Show-SettingsDialog {
     $changeBtn.Add_Click({
         $sel = Show-DeviceDialog
         if ($sel) {
-            Save-Config -mac $sel.MAC -name $sel.Name
+            Save-Config -mac $sel.MAC -name $sel.Name -bleMac $sel.BLEMAC
             $deviceValue.Text = $sel.Name
             $script:deviceChanged = $true
             $script:settingsChanged = $true
@@ -437,7 +780,7 @@ function Show-FirstRunWizard {
         $form.Hide()
         $sel = Show-DeviceDialog -IsWizard
         if ($sel) {
-            Save-Config $sel.MAC $sel.Name
+            Save-Config -mac $sel.MAC -name $sel.Name -bleMac $sel.BLEMAC
             $script:wizardResult = "configured"
             $form.Close()
         } else {
@@ -562,12 +905,14 @@ $script:monitorScript = {
     # Load config
     $deviceName = $null
     $targetMAC = $null
+    $targetBLEMAC = $null
     if (Test-Path $configPath) {
         try {
             $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
             if ($cfg.deviceMAC -and $cfg.deviceMAC -ne "00:00:00:00:00:00") {
                 $targetMAC = $cfg.deviceMAC
                 $deviceName = $cfg.deviceName
+                $targetBLEMAC = $cfg.deviceBLEMAC  # May be null
             }
         } catch {}
     }
@@ -583,6 +928,7 @@ $script:monitorScript = {
                     if ($cfg.deviceMAC -and $cfg.deviceMAC -ne "00:00:00:00:00:00") {
                         $targetMAC = $cfg.deviceMAC
                         $deviceName = $cfg.deviceName
+                        $targetBLEMAC = $cfg.deviceBLEMAC
                         break
                     }
                 } catch {}
@@ -592,10 +938,21 @@ $script:monitorScript = {
 
     $targetAddr = [BT]::ParseMAC($targetMAC)
     $targetBLE = "DEV_" + ($targetMAC -replace ':', '').ToUpper()
-    $targetBLEAddr = [Convert]::ToUInt64(($targetMAC -replace ':', ''), 16)
+
+    # Use dedicated BLE MAC if available, otherwise use main MAC
+    $bleMacToUse = if ($targetBLEMAC) { $targetBLEMAC } else { $targetMAC }
+    $targetBLEAddr = [Convert]::ToUInt64(($bleMacToUse -replace ':', ''), 16)
+
+    # Also prepare secondary BLE ID for PnpDevice check
+    $targetBLE2 = if ($targetBLEMAC -and $targetBLEMAC -ne $targetMAC) {
+        "DEV_" + ($targetBLEMAC -replace ':', '').ToUpper()
+    } else { $null }
 
     Write-Log "=== NearLock Monitor ==="
     Write-Log "Device: $deviceName ($targetMAC)"
+    if ($targetBLEMAC -and $targetBLEMAC -ne $targetMAC) {
+        Write-Log "BLE MAC: $targetBLEMAC"
+    }
     Write-Log "Detection: Classic BT + BLE + BLE-Proximity"
 
     $pollInterval = 4; $lockThreshold = 20; $graceAfterResume = 30
@@ -619,12 +976,19 @@ $script:monitorScript = {
         $classic = [BT]::IsConnected($targetAddr)
         $ble = $false
         try {
-            Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "BTHLE.*$targetBLE" } | ForEach-Object {
-                $st = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_DevNodeStatus' -ErrorAction SilentlyContinue
-                if ($st.Data -and (([int]$st.Data -band 8) -ne 0) -and (([int]$st.Data -band 0x400) -eq 0)) {
-                    $lc = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Bluetooth_LastConnectedTime' -ErrorAction SilentlyContinue
-                    if ($lc.Data -and ((Get-Date) - [DateTime]$lc.Data).TotalSeconds -lt 30) { $ble = $true }
+            # Check both main MAC and dedicated BLE MAC if different
+            $blePatterns = @($targetBLE)
+            if ($targetBLE2) { $blePatterns += $targetBLE2 }
+
+            foreach ($pattern in $blePatterns) {
+                Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "BTHLE.*$pattern" } | ForEach-Object {
+                    $st = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_DevNodeStatus' -ErrorAction SilentlyContinue
+                    if ($st.Data -and (([int]$st.Data -band 8) -ne 0) -and (([int]$st.Data -band 0x400) -eq 0)) {
+                        $lc = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Bluetooth_LastConnectedTime' -ErrorAction SilentlyContinue
+                        if ($lc.Data -and ((Get-Date) - [DateTime]$lc.Data).TotalSeconds -lt 30) { $ble = $true }
+                    }
                 }
+                if ($ble) { break }
             }
         } catch {}
 
