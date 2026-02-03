@@ -970,38 +970,27 @@ $script:monitorScript = {
     }
 
     function Test-Present {
+        # 1. Classic Bluetooth connection check (most reliable for Phone Link etc.)
         $classic = [BT]::IsConnected($targetAddr)
-        $ble = $false
-        try {
-            # Check both main MAC and dedicated BLE MAC if different
-            $blePatterns = @($targetBLE)
-            if ($targetBLE2) { $blePatterns += $targetBLE2 }
 
-            foreach ($pattern in $blePatterns) {
-                Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "BTHLE.*$pattern" } | ForEach-Object {
-                    $st = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_DevNodeStatus' -ErrorAction SilentlyContinue
-                    if ($st.Data -and (([int]$st.Data -band 8) -ne 0) -and (([int]$st.Data -band 0x400) -eq 0)) {
-                        $lc = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Bluetooth_LastConnectedTime' -ErrorAction SilentlyContinue
-                        if ($lc.Data -and ((Get-Date) - [DateTime]$lc.Data).TotalSeconds -lt 30) { $ble = $true }
-                    }
-                }
-                if ($ble) { break }
-            }
-        } catch {}
-
-        # Fallback: BLE proximity via WinRT GATT (device nearby but not actively connected)
+        # 2. BLE proximity via WinRT GATT (for devices nearby but not actively connected)
+        # This is the main proximity check - uses uncached GATT query
         $bleProximity = $false
-        if (-not $classic -and -not $ble) {
+        if (-not $classic) {
             $bleProximity = Test-BLEProximity
         }
 
-        return @{ Classic = $classic; BLE = $ble; BLEProximity = $bleProximity; Connected = ($classic -or $ble -or $bleProximity) }
+        # Debug: log each check result
+        Write-Log "Check: Classic=$classic, BLEProx=$bleProximity"
+
+        return @{ Classic = $classic; BLE = $false; BLEProximity = $bleProximity; Connected = ($classic -or $bleProximity) }
     }
 
     while ($true) {
         try {
             $now = Get-Date
-            if (($now - $lastPoll).TotalSeconds -gt 15) {
+            # Wake detection: if more than 45s since last poll (allows for long BT scans)
+            if (($now - $lastPoll).TotalSeconds -gt 45) {
                 Write-Log "Wake detected - ${graceAfterResume}s grace"
                 $disconnectedSince = $null; $wasConnected = $false; $everConnected = $false; $startupShown = $false
                 Start-Sleep $graceAfterResume
