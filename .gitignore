@@ -1,0 +1,19 @@
+# Build output
+*.exe
+
+# Config files (contain user data)
+config.json
+
+# Log files
+logs/
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
