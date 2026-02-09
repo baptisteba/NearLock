@@ -186,7 +186,15 @@ function Set-StartOnBoot($enabled) {
     try {
         if ($enabled) {
             $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-            Set-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -Value "`"$exePath`"" -ErrorAction Stop
+            # If running as a .ps1 script, the process is powershell.exe — need to include the script path
+            if ($exePath -match '[/\\]powershell\.exe$' -or $exePath -match '[/\\]pwsh\.exe$') {
+                $scriptPath = $PSCommandPath
+                $startCmd = "`"$exePath`" -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
+            } else {
+                # Running as compiled EXE (ps2exe etc.)
+                $startCmd = "`"$exePath`""
+            }
+            Set-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -Value $startCmd -ErrorAction Stop
         } else {
             Remove-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -ErrorAction SilentlyContinue
         }
@@ -404,7 +412,7 @@ function Show-DeviceDialog {
 
     # Warning label
     $warningLabel = New-Object System.Windows.Forms.Label -Property @{
-        Text = "⚠ Phone Link / Mobile Connecte required for reliable detection"
+        Text = "/!\ Phone Link / Mobile Connecte required for reliable detection"
         Location = New-Object System.Drawing.Point(10, 10)
         Size = New-Object System.Drawing.Size(465, 20)
         ForeColor = [System.Drawing.Color]::DarkOrange
@@ -630,7 +638,7 @@ function Show-SettingsDialog {
     })
 
     $phoneLinkWarning = New-Object System.Windows.Forms.Label -Property @{
-        Text = "⚠ Phone Link required"
+        Text = "/!\ Phone Link required"
         Location = New-Object System.Drawing.Point(140, 89)
         Size = New-Object System.Drawing.Size(200, 18)
         ForeColor = [System.Drawing.Color]::DarkOrange
@@ -938,147 +946,280 @@ $script:monitorScript = {
     }
 
     $targetAddr = [BT]::ParseMAC($targetMAC)
-    $targetBLE = "DEV_" + ($targetMAC -replace ':', '').ToUpper()
 
     # Use dedicated BLE MAC if available, otherwise use main MAC
     $bleMacToUse = if ($targetBLEMAC) { $targetBLEMAC } else { $targetMAC }
     $targetBLEAddr = [Convert]::ToUInt64(($bleMacToUse -replace ':', ''), 16)
-
-    # Also prepare secondary BLE ID for PnpDevice check
-    $targetBLE2 = if ($targetBLEMAC -and $targetBLEMAC -ne $targetMAC) {
-        "DEV_" + ($targetBLEMAC -replace ':', '').ToUpper()
-    } else { $null }
 
     Write-Log "=== NearLock Monitor ==="
     Write-Log "Device: $deviceName ($targetMAC)"
     if ($targetBLEMAC -and $targetBLEMAC -ne $targetMAC) {
         Write-Log "BLE MAC: $targetBLEMAC"
     }
-    Write-Log "Detection: Classic BT + BLE + BLE-Proximity"
+    Write-Log "Detection: Classic BT + BLE-GATT (multi-method state machine)"
 
-    $pollInterval = 4; $lockThreshold = 20; $graceAfterResume = 30
-    $disconnectedSince = $null; $wasConnected = $false; $everConnected = $false
-    $lastPoll = Get-Date; $errors = 0; $startupShown = $false
+    # ================================================================
+    # TUNING PARAMETERS
+    # ================================================================
+    $pollInterval     = 4      # Seconds between polls
+    $missesForFading  = 2      # Consecutive misses before FADING (filters transient BT drops)
+    $lockCountdown    = 10     # Seconds of absence before confirmation
+    $confirmDelay     = 3      # Seconds between confirmation passes
+    $graceAfterWake   = 30     # Grace period after wake/resume (seconds)
+    $graceAfterLock   = 30     # Grace period after auto-lock (seconds)
+    $btErrorMax       = 5      # Consecutive BT errors before grace (stack failure)
+    $deepScanEvery    = 5      # Deep scan every N polls during SEARCHING
 
-    # BLE Proximity check via WinRT GATT - detects nearby devices even when not connected
-    # Uses Uncached mode to force actual connection attempt
-    function Test-BLEProximity {
+    # ================================================================
+    # STATE MACHINE
+    # ================================================================
+    # States: SEARCHING → CONNECTED → FADING → CONFIRMING → LOCK
+    #         Any state → GRACE (on wake/BT failure) → SEARCHING
+    $state             = "SEARCHING"
+    $consecutiveMisses = 0
+    $fadingSince       = $null     # Timestamp of first miss (for time-based threshold)
+    $lastSeenMethod    = ""
+    $lastPollTime      = Get-Date
+    $btErrors          = 0
+    $searchLogged      = $false
+    $searchPolls       = 0
+
+    # ================================================================
+    # DETECTION FUNCTIONS (structured results with Ok/Present)
+    # ================================================================
+
+    # Fast: Classic BT connection check (~1ms) - most reliable with Phone Link
+    function Test-ClassicBT {
         try {
-            $bleDevice = Await-WinRT ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($targetBLEAddr)) ([Windows.Devices.Bluetooth.BluetoothLEDevice])
-            if ($null -eq $bleDevice) { return $false }
-
-            # Use Uncached mode to force fresh GATT query (not from cache)
-            $uncached = [Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached
-            $servicesResult = Await-WinRT ($bleDevice.GetGattServicesAsync($uncached)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
-
-            $isNearby = $false
-            if ($null -ne $servicesResult) {
-                if ($servicesResult.Status -eq [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus]::Success) {
-                    if ($bleDevice.ConnectionStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected) {
-                        $isNearby = $true
-                    }
-                }
-            }
-
-            # Close connection to ensure fresh check next time
-            try { $bleDevice.Close() } catch {}
-
-            return $isNearby
-        } catch { return $false }
-    }
-
-    function Test-Present {
-        # 1. Classic Bluetooth connection check (most reliable for Phone Link etc.)
-        $classic = [BT]::IsConnected($targetAddr)
-
-        # 2. BLE proximity via WinRT GATT (for devices nearby but not actively connected)
-        # This is the main proximity check - uses uncached GATT query
-        $bleProximity = $false
-        if (-not $classic) {
-            $bleProximity = Test-BLEProximity
+            return @{ Ok = $true; Present = [BT]::IsConnected($targetAddr) }
+        } catch {
+            return @{ Ok = $false; Present = $false }
         }
-
-        return @{ Classic = $classic; BLE = $false; BLEProximity = $bleProximity; Connected = ($classic -or $bleProximity) }
     }
 
+    # Medium: BLE GATT proximity (~1-8s) - detects nearby even without active connection
+    function Test-BLEGatt {
+        try {
+            $dev = Await-WinRT ([Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($targetBLEAddr)) ([Windows.Devices.Bluetooth.BluetoothLEDevice])
+            if ($null -eq $dev) { return @{ Ok = $true; Present = $false } }
+            $uc = [Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached
+            $svc = Await-WinRT ($dev.GetGattServicesAsync($uc)) ([Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult])
+            $near = ($null -ne $svc -and
+                     $svc.Status -eq [Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus]::Success -and
+                     $dev.ConnectionStatus -eq [Windows.Devices.Bluetooth.BluetoothConnectionStatus]::Connected)
+            try { $dev.Close() } catch {}
+            return @{ Ok = $true; Present = $near }
+        } catch {
+            return @{ Ok = $false; Present = $false }
+        }
+    }
+
+    # Slow: Classic BT inquiry scan (~5-10s) - for confirmation only
+    function Test-ClassicScan {
+        try {
+            return @{ Ok = $true; Present = [BT]::IsNearby($targetAddr, 4) }
+        } catch {
+            return @{ Ok = $false; Present = $false }
+        }
+    }
+
+    # Combined fast check: Classic BT + BLE GATT (short-circuits if Classic finds device)
+    function Test-Fast {
+        $c = Test-ClassicBT
+        if ($c.Ok -and $c.Present) {
+            return @{ Present = $true; AllError = $false; Methods = @("classic") }
+        }
+        # Classic didn't find it - try BLE GATT
+        $b = Test-BLEGatt
+        $methods = @(); $anyOk = $false
+        if ($c.Ok) { $anyOk = $true; if ($c.Present) { $methods += "classic" } }
+        if ($b.Ok) { $anyOk = $true; if ($b.Present) { $methods += "BLE" } }
+        return @{ Present = ($methods.Count -gt 0); AllError = (-not $anyOk); Methods = $methods }
+    }
+
+    # Deep check: all methods including slow inquiry scan
+    function Test-Deep {
+        $r = Test-Fast
+        if ($r.Present) { return $r }
+        $s = Test-ClassicScan
+        if ($s.Ok -and $s.Present) { $r.Present = $true; $r.Methods += "scan" }
+        if ($s.Ok) { $r.AllError = $false }
+        return $r
+    }
+
+    # ================================================================
+    # MAIN LOOP
+    # ================================================================
     while ($true) {
         try {
             $now = Get-Date
-            # Wake detection: if more than 45s since last poll (allows for long BT scans)
-            if (($now - $lastPoll).TotalSeconds -gt 45) {
-                Write-Log "Wake detected - ${graceAfterResume}s grace"
-                $disconnectedSince = $null; $wasConnected = $false; $everConnected = $false; $startupShown = $false
-                Start-Sleep $graceAfterResume
-                $lastPoll = Get-Date
+
+            # --- Wake/resume detection (gap > 45s = sleep/hibernate/BT hang) ---
+            $gap = ($now - $lastPollTime).TotalSeconds
+            if ($gap -gt 45) {
+                Write-Log "Wake/resume (gap: $([int]$gap)s) - grace ${graceAfterWake}s"
+                $state = "SEARCHING"; $consecutiveMisses = 0; $fadingSince = $null
+                $btErrors = 0; $searchLogged = $false; $searchPolls = 0
+                Start-Sleep $graceAfterWake
+                $lastPollTime = Get-Date
+                Write-Log "Grace ended - searching"
                 continue
             }
-            $lastPoll = $now
+            $lastPollTime = $now
 
-            $st = Test-Present
-            $errors = 0
+            # --- State machine ---
+            switch ($state) {
 
-            if ($st.Connected) {
-                if (-not $wasConnected) {
-                    $src = @(); if ($st.Classic) { $src += "classic" }; if ($st.BLE) { $src += "BLE" }; if ($st.BLEProximity) { $src += "BLE-proximite" }
-                    Write-Log "CONNECTE ($($src -join '+'))"
-                }
-                $disconnectedSince = $null; $wasConnected = $true; $everConnected = $true
-            } else {
-                if (-not $everConnected) {
-                    if (-not $startupShown) { Write-Log "$deviceName non connecte - scan de recherche actif"; $startupShown = $true }
-                    $nearby = [BT]::IsNearby($targetAddr, 2)
-                    if (-not $nearby) {
-                        # Fallback to BLE GATT proximity
-                        $nearby = Test-BLEProximity
-                        if ($nearby) {
-                            Write-Log "Found via BLE GATT - CONNECTE"
-                            $wasConnected = $true; $everConnected = $true; $disconnectedSince = $null
-                        }
+                "SEARCHING" {
+                    # Initial state: device not yet found since start/restart/lock
+                    if (-not $searchLogged) {
+                        Write-Log "$deviceName - searching..."
+                        $searchLogged = $true
+                    }
+                    $searchPolls++
+
+                    # Alternate fast checks with periodic deep scans (inquiry)
+                    if ($searchPolls % $deepScanEvery -eq 0) {
+                        $r = Test-Deep
                     } else {
-                        Write-Log "Found via scan - CONNECTE"
-                        $wasConnected = $true; $everConnected = $true; $disconnectedSince = $null
+                        $r = Test-Fast
                     }
-                } else {
-                    if ($wasConnected -and $null -eq $disconnectedSince) {
-                        $disconnectedSince = $now
-                        Write-Log "DECONNECTE - countdown"
+
+                    if ($r.Present) {
+                        $state = "CONNECTED"
+                        $lastSeenMethod = ($r.Methods -join "+")
+                        $consecutiveMisses = 0; $fadingSince = $null; $btErrors = 0
+                        Write-Log "CONNECTE ($lastSeenMethod)"
                     }
-                    if ($null -ne $disconnectedSince) {
-                        $elapsed = ($now - $disconnectedSince).TotalSeconds
-                        Write-Log "Away $([int]$elapsed)s / ${lockThreshold}s"
-                        if ($elapsed -ge $lockThreshold) {
-                            Write-Log "Confirmation scan..."
-                            $nearby = [BT]::IsNearby($targetAddr, 4)
-                            $bleNearby = $false
-                            if (-not $nearby) {
-                                Write-Log "BLE GATT confirmation..."
-                                $bleNearby = Test-BLEProximity
-                            }
-                            if ($nearby -or $bleNearby) {
-                                $method = if ($nearby) { "scan" } else { "BLE GATT" }
-                                Write-Log "Found via $method - false alarm"
-                                $disconnectedSince = $null; $wasConnected = $true
-                            } else {
-                                Write-Log "Confirmed - LOCKING"
-                                [BT]::LockWorkStation() | Out-Null
-                                Start-Sleep 30
-                                $lastPoll = Get-Date
-                                $disconnectedSince = $null; $wasConnected = $false; $everConnected = $false; $startupShown = $false
-                            }
+                }
+
+                "CONNECTED" {
+                    # Device is detected - monitor for disconnection
+                    $r = Test-Fast
+
+                    if ($r.Present) {
+                        # Still here - reset counters
+                        $consecutiveMisses = 0; $fadingSince = $null; $btErrors = 0
+                        $m = ($r.Methods -join "+")
+                        if ($m -ne $lastSeenMethod) {
+                            $lastSeenMethod = $m
+                            Write-Log "CONNECTE ($lastSeenMethod)"
+                        }
+                    }
+                    elseif ($r.AllError) {
+                        # ALL detection methods errored = BT stack issue, NOT absence
+                        $btErrors++
+                        if ($btErrors -ge $btErrorMax) {
+                            Write-Log "BT stack failure ($btErrors errors) - grace ${graceAfterWake}s"
+                            $state = "SEARCHING"; $consecutiveMisses = 0; $fadingSince = $null
+                            $btErrors = 0; $searchLogged = $false; $searchPolls = 0
+                            Start-Sleep $graceAfterWake
+                            $lastPollTime = Get-Date
+                            Write-Log "Grace ended - searching"
+                        } else {
+                            Write-Log "BT error ($btErrors/$btErrorMax) - ignored"
+                        }
+                    }
+                    else {
+                        # Not detected by any method - count consecutive misses
+                        $btErrors = 0
+                        $consecutiveMisses++
+                        if ($consecutiveMisses -eq 1) { $fadingSince = $now }
+
+                        if ($consecutiveMisses -ge $missesForFading) {
+                            $state = "FADING"
+                            Write-Log "DECONNECTE ($consecutiveMisses misses)"
                         }
                     }
                 }
-                $wasConnected = $false
+
+                "FADING" {
+                    # Device not detected for N consecutive polls - countdown to confirmation
+                    $r = Test-Fast
+
+                    if ($r.Present) {
+                        # Device is back - was a transient BT drop
+                        $state = "CONNECTED"
+                        $lastSeenMethod = ($r.Methods -join "+")
+                        $consecutiveMisses = 0; $fadingSince = $null
+                        Write-Log "RECONNECTE ($lastSeenMethod)"
+                    }
+                    elseif ($r.AllError) {
+                        # BT errors during countdown - don't advance timer
+                        $btErrors++
+                        Write-Log "BT error during countdown - paused"
+                        if ($btErrors -ge $btErrorMax) {
+                            Write-Log "BT stack failure - grace ${graceAfterWake}s"
+                            $state = "SEARCHING"; $consecutiveMisses = 0; $fadingSince = $null
+                            $btErrors = 0; $searchLogged = $false; $searchPolls = 0
+                            Start-Sleep $graceAfterWake
+                            $lastPollTime = Get-Date
+                            Write-Log "Grace ended - searching"
+                        }
+                    }
+                    else {
+                        $consecutiveMisses++
+                        $elapsed = ($now - $fadingSince).TotalSeconds
+                        Write-Log "Away $([int]$elapsed)s / ${lockCountdown}s"
+
+                        if ($elapsed -ge $lockCountdown) {
+                            $state = "CONFIRMING"
+                            Write-Log "Threshold reached - confirming..."
+                        }
+                    }
+                }
+
+                "CONFIRMING" {
+                    # Run deep confirmation: 2 passes before locking
+                    # Pass 1: Full deep scan (Classic BT + BLE GATT + inquiry scan)
+                    Write-Log "Confirmation 1/2 (deep scan)..."
+                    $deep = Test-Deep
+
+                    if ($deep.Present) {
+                        Write-Log "Found ($($deep.Methods -join '+')) - false alarm"
+                        $state = "CONNECTED"
+                        $lastSeenMethod = ($deep.Methods -join "+")
+                        $consecutiveMisses = 0; $fadingSince = $null
+                    } else {
+                        # Wait then recheck with fast methods
+                        Start-Sleep $confirmDelay
+                        Write-Log "Confirmation 2/2 (recheck)..."
+                        $recheck = Test-Fast
+
+                        if ($recheck.Present) {
+                            Write-Log "Found ($($recheck.Methods -join '+')) - false alarm"
+                            $state = "CONNECTED"
+                            $lastSeenMethod = ($recheck.Methods -join "+")
+                            $consecutiveMisses = 0; $fadingSince = $null
+                        } else {
+                            # Both passes confirm absent - LOCK
+                            Write-Log "Confirmed absent - LOCKING"
+                            [BT]::LockWorkStation() | Out-Null
+
+                            # Post-lock: grace period then back to searching
+                            Write-Log "Post-lock grace ${graceAfterLock}s"
+                            $state = "SEARCHING"; $consecutiveMisses = 0; $fadingSince = $null
+                            $btErrors = 0; $searchLogged = $false; $searchPolls = 0
+                            Start-Sleep $graceAfterLock
+                            $lastPollTime = Get-Date
+                            Write-Log "Grace ended - searching"
+                        }
+                    }
+                }
             }
+
         } catch {
-            $errors++
-            Write-Log "Error ($errors): $($_.Exception.Message)"
-            if ($errors -ge 3) {
-                Write-Log "Too many errors - reset"
-                $disconnectedSince = $null; $wasConnected = $false; $everConnected = $false; $startupShown = $false; $errors = 0
+            $btErrors++
+            Write-Log "Error: $($_.Exception.Message)"
+            if ($btErrors -ge $btErrorMax) {
+                Write-Log "Too many errors - grace 10s"
+                $state = "SEARCHING"; $consecutiveMisses = 0; $fadingSince = $null
+                $btErrors = 0; $searchLogged = $false; $searchPolls = 0
                 Start-Sleep 10
+                $lastPollTime = Get-Date
             }
         }
+
         Start-Sleep $pollInterval
     }
 }
@@ -1198,16 +1339,36 @@ $timer.Add_Tick({
     $f = Join-Path $script:logDir "NearLock_$(Get-Date -Format 'yyyy-MM-dd').log"
     if (-not (Test-Path $f)) { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock (no log)"; return }
     try {
-        $lines = @(Get-Content $f -Tail 10 -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^\[' }
-        $last = ($lines | Select-Object -Last 3) -join "`n"
-        if ($last -match 'No device configured') { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock: No device" }
-        elseif ($last -match 'non connecte|scan de recherche') { $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Searching..." }
-        elseif ($last -match 'CONNECTE' -and $last -notmatch 'DECONNECTE') {
+        # Check only the LAST log line for status (fixes stale state from older lines)
+        $lines = @(Get-Content $f -Tail 5 -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^\[' }
+        $last = ($lines | Select-Object -Last 1)
+        if (-not $last) { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock"; return }
+        # Green: device connected (check first to avoid "non connecte" matching "CONNECTE")
+        if ($last -match 'CONNECTE \(|RECONNECTE \(|false alarm') {
             $script:tray.Icon = $script:iconGreen
-            if ($last -match 'BLE-proximite|BLE GATT') { $script:tray.Text = "NearLock: Nearby (BLE)" }
+            if ($last -match 'BLE') { $script:tray.Text = "NearLock: Nearby (BLE)" }
             else { $script:tray.Text = "NearLock: Connected" }
         }
-        elseif ($last -match 'Starting|Demarrage') { $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Starting..." }
+        # Orange: away/countdown/confirming
+        elseif ($last -match 'DECONNECTE|Away \d|[Cc]onfirm|Threshold') {
+            $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Away..."
+        }
+        # Orange: searching/grace/BT errors
+        elseif ($last -match 'searching|[Gg]race|BT error|BT stack') {
+            $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Searching..."
+        }
+        # Orange: locking
+        elseif ($last -match 'LOCKING') {
+            $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Locking..."
+        }
+        # Orange: starting
+        elseif ($last -match 'Starting|Monitor') {
+            $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Starting..."
+        }
+        # Grey: no device / unknown
+        elseif ($last -match 'No device') {
+            $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock: No device"
+        }
         else { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock" }
     } catch { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock (error)" }
 })
