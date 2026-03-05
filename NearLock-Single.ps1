@@ -16,10 +16,29 @@ if (-not (Test-Path $script:dataDir)) { New-Item -ItemType Directory -Path $scri
 $script:logDir = Join-Path $script:dataDir "logs"
 if (-not (Test-Path $script:logDir)) { New-Item -ItemType Directory -Path $script:logDir -Force | Out-Null }
 $script:configPath = Join-Path $script:dataDir "config.json"
+$script:stoppedFlag = Join-Path $script:dataDir ".stopped"
 $script:autoLockEnabled = $true
 $script:monitorRunspace = $null
 $script:monitorPowerShell = $null
 $script:logWindow = $null
+
+# --- Watchdog mode (--watchdog) ---
+# When launched with --watchdog, just check if NearLock needs restarting and exit.
+if ($args -contains "--watchdog") {
+    # Don't restart if user explicitly stopped it
+    if (Test-Path $script:stoppedFlag) { exit 0 }
+    # Don't restart if already running
+    $running = Get-Process -Name "NearLock" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Id -ne $PID }
+    if (-not $running) {
+        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        Start-Process -FilePath $exePath -WindowStyle Hidden
+    }
+    exit 0
+}
+
+# --- Normal startup: clear stopped flag ---
+Remove-Item -Path $script:stoppedFlag -Force -ErrorAction SilentlyContinue
 
 # --- Single instance check ---
 $script:mutexName = "Global\NearLock-mutex"
@@ -31,7 +50,7 @@ try {
     $script:hasMutex = $true
 }
 if (-not $script:hasMutex) {
-    [System.Windows.Forms.MessageBox]::Show("NearLock is already running.", "NearLock", 0, 64)
+    # Silent exit — watchdog or duplicate launch, no popup
     exit
 }
 
@@ -171,12 +190,17 @@ function Save-Config {
     $data | ConvertTo-Json | Set-Content $script:configPath -Encoding UTF8
 }
 
-# --- Startup management ---
+# --- Startup management (Scheduled Task + Watchdog) ---
+$script:taskName = "NearLock-Watchdog"
 $script:startupRegPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $script:startupRegName = "NearLock"
 
 function Get-StartOnBoot {
     try {
+        # Check for scheduled task first (new method)
+        $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
+        if ($task) { return $true }
+        # Fallback: check old registry key (for migration)
         $val = Get-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -ErrorAction SilentlyContinue
         return ($null -ne $val)
     } catch { return $false }
@@ -184,19 +208,30 @@ function Get-StartOnBoot {
 
 function Set-StartOnBoot($enabled) {
     try {
+        # Always clean up old registry key if present
+        Remove-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -ErrorAction SilentlyContinue
+
         if ($enabled) {
+            # Remove existing task to recreate cleanly
+            Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+            # Use the exe itself with --watchdog flag (no separate script needed)
             $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-            # If running as a .ps1 script, the process is powershell.exe — need to include the script path
-            if ($exePath -match '[/\\]powershell\.exe$' -or $exePath -match '[/\\]pwsh\.exe$') {
-                $scriptPath = $PSCommandPath
-                $startCmd = "`"$exePath`" -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
-            } else {
-                # Running as compiled EXE (ps2exe etc.)
-                $startCmd = "`"$exePath`""
-            }
-            Set-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -Value $startCmd -ErrorAction Stop
+            $action = New-ScheduledTaskAction -Execute "`"$exePath`"" -Argument "--watchdog"
+
+            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            # Repeat every 2 minutes indefinitely
+            $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At "00:00" `
+                -RepetitionInterval (New-TimeSpan -Minutes 2)).Repetition
+
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+
+            Register-ScheduledTask -TaskName $script:taskName -Action $action -Trigger $trigger `
+                -Settings $settings -Description "Watchdog: restarts NearLock if it crashes" `
+                -ErrorAction Stop | Out-Null
         } else {
-            Remove-ItemProperty -Path $script:startupRegPath -Name $script:startupRegName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false -ErrorAction SilentlyContinue
         }
         Save-Config -startOnBoot $enabled
         return $true
@@ -1322,6 +1357,8 @@ $cms.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{ Text = "Exit" }
 $exitItem.Add_Click({
+    # Mark as user-stopped so the watchdog won't restart
+    try { "stopped" | Set-Content $script:stoppedFlag -Force } catch {}
     try { Stop-Monitor } catch {}
     try { if ($script:logWindow -and -not $script:logWindow.IsDisposed) { $script:logWindow.Close() } } catch {}
     try { $script:tray.Visible = $false; $script:tray.Dispose() } catch {}
@@ -1378,6 +1415,7 @@ $timer.Start()
 if (Test-NeedsWizard) {
     $result = Show-FirstRunWizard
     if ($result -eq "exit") {
+        try { "stopped" | Set-Content $script:stoppedFlag -Force } catch {}
         try { $timer.Stop(); $timer.Dispose() } catch {}
         try { $script:tray.Visible = $false; $script:tray.Dispose() } catch {}
         try { if ($script:hasMutex) { $script:mutex.ReleaseMutex() }; $script:mutex.Dispose() } catch {}
