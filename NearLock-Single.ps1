@@ -22,6 +22,21 @@ $script:monitorRunspace = $null
 $script:monitorPowerShell = $null
 $script:logWindow = $null
 
+function Resolve-NearLockExe {
+    $myExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    # Si on EST NearLock.exe (ps2exe), utiliser notre propre chemin
+    if ($myExe -match '[\\\/]NearLock\.exe$') { return $myExe }
+    # Sinon, chercher NearLock.exe à côté du script .ps1
+    if ($PSScriptRoot) {
+        $candidate = Join-Path $PSScriptRoot "NearLock.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+    # Fallback : chemin connu
+    $candidate = "C:\Users\bd200\Scripts\NearLock-GitHub\NearLock.exe"
+    if (Test-Path $candidate) { return $candidate }
+    return $myExe
+}
+
 # --- Watchdog mode (--watchdog) ---
 # When launched with --watchdog, just check if NearLock needs restarting and exit.
 if ($args -contains "--watchdog") {
@@ -31,7 +46,9 @@ if ($args -contains "--watchdog") {
     $running = Get-Process -Name "NearLock" -ErrorAction SilentlyContinue |
         Where-Object { $_.Id -ne $PID }
     if (-not $running) {
-        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $exePath = Resolve-NearLockExe
+        $wdLog = Join-Path $script:logDir "NearLock_$(Get-Date -Format 'yyyy-MM-dd').log"
+        Add-Content -Path $wdLog -Value "$(Get-Date -Format 'HH:mm:ss') [WD] Restarting NearLock: $exePath" -ErrorAction SilentlyContinue
         Start-Process -FilePath $exePath -WindowStyle Hidden
     }
     exit 0
@@ -216,7 +233,7 @@ function Set-StartOnBoot($enabled) {
             Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false -ErrorAction SilentlyContinue
 
             # Use the exe itself with --watchdog flag (no separate script needed)
-            $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $exePath = Resolve-NearLockExe
             $action = New-ScheduledTaskAction -Execute "`"$exePath`"" -Argument "--watchdog"
 
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
@@ -237,6 +254,23 @@ function Set-StartOnBoot($enabled) {
         return $true
     } catch { return $false }
 }
+
+# --- Auto-repair watchdog task at startup ---
+try {
+    $cfg = Get-Config
+    $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
+    if ($task) {
+        $taskExe = $task.Actions[0].Execute -replace '"', ''
+        $correctExe = Resolve-NearLockExe
+        if ($taskExe -ne $correctExe) {
+            Write-Log "Watchdog task pointe vers mauvais exe: $taskExe → fix vers $correctExe"
+            Set-StartOnBoot $true
+        }
+    } elseif ($cfg -and $cfg.startOnBoot) {
+        Write-Log "Watchdog task absente mais startOnBoot=true → recreation"
+        Set-StartOnBoot $true
+    }
+} catch {}
 
 function Get-PairedDevices {
     try {
