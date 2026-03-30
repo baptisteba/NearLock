@@ -1461,9 +1461,11 @@ $timer.Add_Tick({
     $f = Join-Path $script:logDir "NearLock_$(Get-Date -Format 'yyyy-MM-dd').log"
     if (-not (Test-Path $f)) { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock (no log)"; return }
     try {
-        # Check only the LAST log line for status (fixes stale state from older lines)
-        $lines = @(Get-Content $f -Tail 5 -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^\[' }
-        $last = ($lines | Select-Object -Last 1)
+        # Find the last line representing a real state change (ignore BT noise/errors)
+        $lines = @(Get-Content $f -Tail 20 -ErrorAction SilentlyContinue) | Where-Object { $_ -match '^\[' }
+        $last = ($lines | Where-Object {
+            $_ -match 'CONNECTE \(|RECONNECTE \(|false alarm|DECONNECTE|Away \d|[Cc]onfirm|Threshold|LOCKING|searching|No device'
+        }) | Select-Object -Last 1
         if (-not $last) { $script:tray.Icon = $script:iconGrey; $script:tray.Text = "NearLock"; return }
         # Green: device connected (check first to avoid "non connecte" matching "CONNECTE")
         if ($last -match 'CONNECTE \(|RECONNECTE \(|false alarm') {
@@ -1475,8 +1477,8 @@ $timer.Add_Tick({
         elseif ($last -match 'DECONNECTE|Away \d|[Cc]onfirm|Threshold') {
             $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Away..."
         }
-        # Orange: searching/grace/BT errors
-        elseif ($last -match 'searching|[Gg]race|BT error|BT stack') {
+        # Orange: searching
+        elseif ($last -match 'searching') {
             $script:tray.Icon = $script:iconOrange; $script:tray.Text = "NearLock: Searching..."
         }
         # Orange: locking
