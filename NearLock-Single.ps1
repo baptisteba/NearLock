@@ -22,19 +22,20 @@ $script:monitorRunspace = $null
 $script:monitorPowerShell = $null
 $script:logWindow = $null
 
-function Resolve-NearLockExe {
+function Resolve-NearLockLaunch {
+    # Si on EST NearLock.exe (ps2exe), se relancer soi-même
     $myExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    # Si on EST NearLock.exe (ps2exe), utiliser notre propre chemin
-    if ($myExe -match '[\\\/]NearLock\.exe$') { return $myExe }
-    # Sinon, chercher NearLock.exe à côté du script .ps1
-    if ($PSScriptRoot) {
-        $candidate = Join-Path $PSScriptRoot "NearLock.exe"
-        if (Test-Path $candidate) { return $candidate }
+    if ($myExe -match '[\\\/]NearLock\.exe$') {
+        return @{ FilePath = $myExe; ArgumentList = $null }
     }
-    # Fallback : chemin connu
-    $candidate = "C:\Users\bd200\Scripts\NearLock-GitHub\NearLock.exe"
-    if (Test-Path $candidate) { return $candidate }
-    return $myExe
+    # Running as .ps1 — utilise powershell.exe pour éviter le blocage SAC sur NearLock.exe non signé
+    $scriptPath = if ($PSCommandPath) { $PSCommandPath }
+                  elseif ($PSScriptRoot) { Join-Path $PSScriptRoot 'NearLock-Single.ps1' }
+                  else { 'C:\Users\bd200\Scripts\NearLock-GitHub\NearLock-Single.ps1' }
+    return @{
+        FilePath     = 'powershell.exe'
+        ArgumentList = "-NonInteractive -WindowStyle Hidden -File `"$scriptPath`""
+    }
 }
 
 # --- Watchdog mode (--watchdog) ---
@@ -42,14 +43,25 @@ function Resolve-NearLockExe {
 if ($args -contains "--watchdog") {
     # Don't restart if user explicitly stopped it
     if (Test-Path $script:stoppedFlag) { exit 0 }
-    # Don't restart if already running
-    $running = Get-Process -Name "NearLock" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Id -ne $PID }
-    if (-not $running) {
-        $exePath = Resolve-NearLockExe
+    # Check if NearLock is running via the named mutex (works for both .exe and .ps1 modes)
+    $wdMutex = New-Object System.Threading.Mutex($false, "Global\NearLock-mutex")
+    $alreadyRunning = $false
+    try {
+        if ($wdMutex.WaitOne(0, $false)) { $wdMutex.ReleaseMutex() }
+        else { $alreadyRunning = $true }
+    } catch [System.Threading.AbandonedMutexException] {
+        try { $wdMutex.ReleaseMutex() } catch {}
+    } finally { $wdMutex.Close() }
+    if (-not $alreadyRunning) {
+        $launch = Resolve-NearLockLaunch
         $wdLog = Join-Path $script:logDir "NearLock_$(Get-Date -Format 'yyyy-MM-dd').log"
-        Add-Content -Path $wdLog -Value "$(Get-Date -Format 'HH:mm:ss') [WD] Restarting NearLock: $exePath" -ErrorAction SilentlyContinue
-        Start-Process -FilePath $exePath -WindowStyle Hidden
+        $launchDesc = "$($launch.FilePath) $($launch.ArgumentList)"
+        Add-Content -Path $wdLog -Value "$(Get-Date -Format 'HH:mm:ss') [WD] Restarting NearLock: $launchDesc" -ErrorAction SilentlyContinue
+        if ($launch.ArgumentList) {
+            Start-Process -FilePath $launch.FilePath -ArgumentList $launch.ArgumentList
+        } else {
+            Start-Process -FilePath $launch.FilePath -WindowStyle Hidden
+        }
     }
     exit 0
 }
@@ -232,9 +244,13 @@ function Set-StartOnBoot($enabled) {
             # Remove existing task to recreate cleanly
             Unregister-ScheduledTask -TaskName $script:taskName -Confirm:$false -ErrorAction SilentlyContinue
 
-            # Use the exe itself with --watchdog flag (no separate script needed)
-            $exePath = Resolve-NearLockExe
-            $action = New-ScheduledTaskAction -Execute "`"$exePath`"" -Argument "--watchdog"
+            # Construire la commande de lancement sans passer par NearLock.exe non signé
+            $launch = Resolve-NearLockLaunch
+            if ($launch.ArgumentList) {
+                $action = New-ScheduledTaskAction -Execute "`"$($launch.FilePath)`"" -Argument "$($launch.ArgumentList) --watchdog"
+            } else {
+                $action = New-ScheduledTaskAction -Execute "`"$($launch.FilePath)`"" -Argument "--watchdog"
+            }
 
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
             # Repeat every 2 minutes indefinitely
@@ -260,10 +276,16 @@ try {
     $cfg = Get-Config
     $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
     if ($task) {
+        $launch = Resolve-NearLockLaunch
         $taskExe = $task.Actions[0].Execute -replace '"', ''
-        $correctExe = Resolve-NearLockExe
-        if ($taskExe -ne $correctExe) {
-            Write-Log "Watchdog task pointe vers mauvais exe: $taskExe → fix vers $correctExe"
+        $taskArgs = $task.Actions[0].Arguments
+        $valid = if ($launch.ArgumentList) {
+            ($taskExe -match 'powershell(\.exe)?$') -and ($taskArgs -like '*NearLock-Single.ps1*')
+        } else {
+            $taskExe -eq $launch.FilePath
+        }
+        if (-not $valid) {
+            Write-Log "Watchdog task invalide ($taskExe) → recréation"
             Set-StartOnBoot $true
         }
     } elseif ($cfg -and $cfg.startOnBoot) {
@@ -426,15 +448,19 @@ function Merge-DeviceLists {
     }
 
     # Add/merge BLE devices - try to link by name or add as separate
+    # $d.Source = "BLE"         → physically scanned nearby (real detection)
+    # $d.Source = "BLE (Paired)"→ from Windows cache, device may be anywhere — NOT a proximity signal
     foreach ($d in $BLEDevices) {
+        $isPhysical = ($d.Source -eq "BLE")   # true = radio-detected nearby
         $linked = $false
         # Try to find matching device by name
         foreach ($key in @($merged.Keys)) {
             $existing = $merged[$key]
             if ($existing.Name -eq $d.Name -and $d.Name -ne "(Unknown BLE)" -and $d.Name -ne "(Unknown)") {
-                # Link BLE MAC to existing device
+                # Always store BLEMAC — monitor uses it for GATT proximity regardless of distance
                 $existing.BLEMAC = $d.MAC
-                if ("BLE" -notin $existing.Sources) {
+                # Only add "BLE" to Sources if physically detected — cache hits don't count
+                if ($isPhysical -and "BLE" -notin $existing.Sources) {
                     $existing.Sources += "BLE"
                 }
                 $linked = $true
@@ -443,20 +469,19 @@ function Merge-DeviceLists {
         }
 
         if (-not $linked) {
-            # Check if MAC already exists (some devices use same MAC for BT and BLE)
             if ($merged.ContainsKey($d.MAC)) {
-                if ("BLE" -notin $merged[$d.MAC].Sources) {
+                if ($isPhysical -and "BLE" -notin $merged[$d.MAC].Sources) {
                     $merged[$d.MAC].Sources += "BLE"
                 }
             } else {
-                # Add as new BLE-only device
+                # New entry: physically scanned → tag as BLE; cache-only → tag as Paired (not nearby)
                 $merged[$d.MAC] = [PSCustomObject]@{
-                    Name = $d.Name
-                    MAC = $d.MAC
-                    BLEMAC = $d.MAC
+                    Name      = $d.Name
+                    MAC       = $d.MAC
+                    BLEMAC    = $d.MAC
                     Connected = $false
-                    Sources = @("BLE")
-                    IsPaired = ($d.Source -eq "BLE (Paired)")
+                    Sources   = @(if ($isPhysical) { "BLE" } else { "Paired" })
+                    IsPaired  = (-not $isPhysical)
                 }
             }
         }
@@ -471,7 +496,7 @@ function Show-DeviceDialog {
     $title = if ($IsWizard) { "NearLock Setup - Select Device" } else { "Scan for Nearby Devices" }
     $form = New-Object System.Windows.Forms.Form -Property @{
         Text = $title
-        Size = New-Object System.Drawing.Size(500, 420)
+        Size = New-Object System.Drawing.Size(660, 460)
         StartPosition = "CenterScreen"
         FormBorderStyle = "FixedDialog"
         MaximizeBox = $false
@@ -483,7 +508,7 @@ function Show-DeviceDialog {
     $warningLabel = New-Object System.Windows.Forms.Label -Property @{
         Text = "/!\ Phone Link / Mobile Connecte required for reliable detection"
         Location = New-Object System.Drawing.Point(10, 10)
-        Size = New-Object System.Drawing.Size(465, 20)
+        Size = New-Object System.Drawing.Size(630, 20)
         ForeColor = [System.Drawing.Color]::DarkOrange
         Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
     }
@@ -498,38 +523,48 @@ function Show-DeviceDialog {
     $scanStatus = New-Object System.Windows.Forms.Label -Property @{
         Text = "Click 'Start Scan' to discover nearby devices"
         Location = New-Object System.Drawing.Point(140, 41)
-        Size = New-Object System.Drawing.Size(330, 20)
+        Size = New-Object System.Drawing.Size(500, 20)
         ForeColor = [System.Drawing.Color]::Gray
     }
 
     # Device list
     $scanList = New-Object System.Windows.Forms.ListView -Property @{
         Location = New-Object System.Drawing.Point(10, 70)
-        Size = New-Object System.Drawing.Size(465, 255)
+        Size = New-Object System.Drawing.Size(630, 270)
         View = "Details"
         FullRowSelect = $true
         GridLines = $true
+        UseCompatibleStateImageBehavior = $false
     }
-    $scanList.Columns.Add("Name", 160) | Out-Null
-    $scanList.Columns.Add("MAC Address", 130) | Out-Null
-    $scanList.Columns.Add("BLE MAC", 110) | Out-Null
-    $scanList.Columns.Add("Sources", 90) | Out-Null
+    $scanList.Columns.Add("Name", 210) | Out-Null
+    $scanList.Columns.Add("MAC Address", 145) | Out-Null
+    $scanList.Columns.Add("BLE MAC", 135) | Out-Null
+    $scanList.Columns.Add("Sources", 115) | Out-Null
+
+    # Legend
+    $legend = New-Object System.Windows.Forms.Label -Property @{
+        Text = "  Bold/yellow = configured device     Green = connected     Gray/italic = paired but not in range"
+        Location = New-Object System.Drawing.Point(10, 346)
+        Size = New-Object System.Drawing.Size(630, 18)
+        ForeColor = [System.Drawing.Color]::DimGray
+        Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    }
 
     # Buttons
     $okBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "OK"
-        Location = New-Object System.Drawing.Point(300, 340)
+        Location = New-Object System.Drawing.Point(460, 375)
         Size = New-Object System.Drawing.Size(80, 30)
     }
 
     $cancelBtn = New-Object System.Windows.Forms.Button -Property @{
         Text = "Cancel"
-        Location = New-Object System.Drawing.Point(390, 340)
+        Location = New-Object System.Drawing.Point(555, 375)
         Size = New-Object System.Drawing.Size(80, 30)
         DialogResult = "Cancel"
     }
 
-    $form.Controls.AddRange(@($warningLabel, $scanBtn, $scanStatus, $scanList, $okBtn, $cancelBtn))
+    $form.Controls.AddRange(@($warningLabel, $scanBtn, $scanStatus, $scanList, $legend, $okBtn, $cancelBtn))
     $form.CancelButton = $cancelBtn
 
     # Store selected device and scanned devices
@@ -571,10 +606,26 @@ function Show-DeviceDialog {
             $item.SubItems.Add($(if ($d.BLEMAC -and $d.BLEMAC -ne $d.MAC) { $d.BLEMAC } else { "-" })) | Out-Null
             $item.SubItems.Add(($d.Sources -join ", ")) | Out-Null
             $item.Tag = $d
-            if ($d.Connected) { $item.ForeColor = [System.Drawing.Color]::Green }
-            elseif ($d.IsPaired) { $item.ForeColor = [System.Drawing.Color]::Blue }
+
+            $isNearby     = ($d.Sources -contains "Classic BT") -or ($d.Sources -contains "BLE")
+            $isConfigured = $cfg -and ($d.MAC -eq $cfg.deviceMAC -or $d.BLEMAC -eq $cfg.deviceMAC)
+
+            if ($isConfigured) {
+                $item.BackColor = [System.Drawing.Color]::LightYellow
+                $item.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+            }
+            if ($d.Connected) {
+                $item.ForeColor = [System.Drawing.Color]::DarkGreen
+            } elseif (-not $isNearby) {
+                # Paired but not found by scan — grayed out
+                $item.ForeColor = [System.Drawing.Color]::Gray
+                if (-not $isConfigured) {
+                    $item.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Italic)
+                }
+            }
+
             # Pre-select current device if configured
-            if ($cfg -and ($d.MAC -eq $cfg.deviceMAC -or $d.BLEMAC -eq $cfg.deviceMAC)) { $item.Selected = $true }
+            if ($isConfigured) { $item.Selected = $true }
             $scanList.Items.Add($item) | Out-Null
         }
 
