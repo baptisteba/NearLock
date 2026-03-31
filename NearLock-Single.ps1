@@ -58,7 +58,7 @@ if ($args -contains "--watchdog") {
         $launchDesc = "$($launch.FilePath) $($launch.ArgumentList)"
         Add-Content -Path $wdLog -Value "$(Get-Date -Format 'HH:mm:ss') [WD] Restarting NearLock: $launchDesc" -ErrorAction SilentlyContinue
         if ($launch.ArgumentList) {
-            Start-Process -FilePath $launch.FilePath -ArgumentList $launch.ArgumentList
+            Start-Process -FilePath $launch.FilePath -ArgumentList $launch.ArgumentList -WindowStyle Hidden
         } else {
             Start-Process -FilePath $launch.FilePath -WindowStyle Hidden
         }
