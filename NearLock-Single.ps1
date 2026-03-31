@@ -34,7 +34,7 @@ function Resolve-NearLockLaunch {
                   else { 'C:\Users\bd200\Scripts\NearLock-GitHub\NearLock-Single.ps1' }
     return @{
         FilePath     = 'powershell.exe'
-        ArgumentList = "-NonInteractive -WindowStyle Hidden -File `"$scriptPath`""
+        ArgumentList = "-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`""
     }
 }
 
