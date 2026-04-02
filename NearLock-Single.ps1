@@ -6,9 +6,16 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
-# Load WinRT types for BLE proximity check
-$null = [Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
-$null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+# Load WinRT types for BLE proximity check (retry at boot — WinRT may not be ready yet)
+for ($i = 0; $i -lt 5; $i++) {
+    try {
+        $null = [Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+        $null = [Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult, Windows.Devices.Bluetooth, ContentType=WindowsRuntime]
+        break
+    } catch {
+        Start-Sleep -Seconds 3
+    }
+}
 
 # --- Paths ---
 $script:dataDir = Join-Path $env:LOCALAPPDATA "NearLock"
